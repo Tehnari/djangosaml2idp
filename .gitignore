@@ -11,6 +11,8 @@
 .env
 env/
 
+djangosaml2idp.egg-info
+
 .cache
 .coverage
 
