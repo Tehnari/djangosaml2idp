@@ -20,10 +20,17 @@ def repr_saml(saml: str, b64: bool = False):
         msg = base64.b64decode(saml).decode() if b64 else saml
         dom = xml.dom.minidom.parseString(msg)
     except (UnicodeDecodeError, ExpatError):
-        # in HTTP-REDIRECT the base64 must be inflated
-        compressed = base64.b64decode(saml)
-        inflated = zlib.decompress(compressed, -15)
-        dom = xml.dom.minidom.parseString(inflated.decode())
+        try:
+            # in HTTP-REDIRECT the base64 must be inflated
+            compressed = base64.b64decode(saml)
+            try:
+                inflated = zlib.decompress(compressed, -15)
+            except zlib.error:          # not deflated – use as-is
+                inflated = compressed
+            dom = xml.dom.minidom.parseString(inflated.decode())
+        except Exception as e:
+            # If all decoding fails, return error message instead of crashing
+            return f"[Error decoding SAML: {type(e).__name__}: {e}]"
     return dom.toprettyxml()
 
 
