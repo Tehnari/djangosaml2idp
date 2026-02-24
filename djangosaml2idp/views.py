@@ -1,9 +1,12 @@
 import base64
 import logging
+import time
+import uuid
 from typing import Dict, List, Optional, Union
 
 from django.conf import settings
 from django.contrib.auth import get_user_model, logout
+from django.core.cache import cache
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.exceptions import (ImproperlyConfigured, ObjectDoesNotExist,
                                     PermissionDenied, ValidationError)
@@ -37,8 +40,14 @@ logger = logging.getLogger(__name__)
 User = get_user_model()
 
 
-def store_params_in_session(request: HttpRequest) -> None:
-    """ Gathers the SAML parameters from the HTTP request and store them in the session
+def store_params_in_session(request: HttpRequest) -> str:
+    """ Gathers the SAML parameters from the HTTP request and store them in the session.
+    
+    Also stores in cache as fallback in case session cookies are lost during cross-site redirects.
+    This provides resilience against browser cookie issues (SameSite, third-party cookie blocking, etc.)
+    
+    Returns:
+        str: UUID state parameter for cache lookup and cookie storage
     """
     if request.method == 'POST':
         # future TODO: parse also SOAP and PAOS format from POST
@@ -51,11 +60,66 @@ def store_params_in_session(request: HttpRequest) -> None:
     try:
         saml_request = passed_data['SAMLRequest']
     except (KeyError, MultiValueDictKeyError) as e:
+        logger.error(
+            f"SAML2 SSO Entry: Missing SAMLRequest parameter. "
+            f"Method: {request.method}, Path: {request.path}, "
+            f"User-Agent: {request.META.get('HTTP_USER_AGENT', 'Unknown')}, "
+            f"Referer: {request.META.get('HTTP_REFERER', 'None')}"
+        )
         raise ValidationError(_('not a valid SAMLRequest: {}').format(repr(e)))
 
-    request.session['Binding'] = binding
-    request.session['SAMLRequest'] = saml_request
-    request.session['RelayState'] = passed_data.get('RelayState', '')
+    relay_state = passed_data.get('RelayState', '')
+    
+    # Generate UUID state parameter for hybrid storage (session + cookie + cache)
+    state_uuid = str(uuid.uuid4())
+    
+    # Store in session (primary storage) - keep existing keys for backward compatibility
+    try:
+        request.session['Binding'] = binding
+        request.session['SAMLRequest'] = saml_request
+        request.session['RelayState'] = relay_state
+        # Store state UUID in session for hybrid approach
+        request.session['saml2_auth_state_uuid'] = state_uuid
+        # Note: Django's session middleware saves automatically, but explicit save ensures immediate persistence
+        # This helps with cross-site redirects where session continuity is critical
+        try:
+            request.session.save()
+        except Exception as save_error:
+            # Log but don't fail - session middleware will handle save later
+            logger.debug(f"SAML2 SSO Entry: Session save warning (non-critical): {save_error}")
+        
+        logger.debug(
+            f"SAML2 SSO Entry: Stored in session. "
+            f"Session key: {request.session.session_key}, "
+            f"State UUID: {state_uuid}, "
+            f"Binding: {binding}, "
+            f"RelayState: {relay_state[:50] if relay_state else 'None'}"
+        )
+    except Exception as session_error:
+        logger.warning(
+            f"SAML2 SSO Entry: Failed to store in session: {session_error}. "
+            f"Session key: {request.session.session_key if hasattr(request.session, 'session_key') else 'None'}"
+        )
+        # Continue to cache fallback
+    
+    # Store in cache with UUID key (for cross-site cookie issues)
+    # This replaces the old session-key-based cache storage
+    try:
+        cache_key = f'saml2_request_{state_uuid}'
+        cache_data = {
+            'SAMLRequest': saml_request,
+            'Binding': binding,
+            'RelayState': relay_state,
+            'timestamp': time.time(),
+        }
+        # Store for 10 minutes (enough time for authentication flow)
+        cache.set(cache_key, cache_data, timeout=600)
+        logger.debug(f"SAML2 SSO Entry: Stored in cache with UUID key. Cache key: {cache_key}")
+    except Exception as cache_error:
+        logger.warning(f"SAML2 SSO Entry: Failed to store in cache: {cache_error}")
+        # Non-critical, continue with session only
+    
+    return state_uuid
 
 
 @never_cache
@@ -66,14 +130,43 @@ def sso_entry(request: HttpRequest, *args, **kwargs) -> HttpResponse:
         and redirects to the login_process view.
     """
     try:
-        store_params_in_session(request)
+        state_uuid = store_params_in_session(request)
     except ValidationError as e:
         return error_cbv.handle_error(request, e, status_code=400)
 
-    logger.debug("SSO requested to IDP with binding {}".format(request.session['Binding']))
-    logger.debug("--- SAML request [\n{}] ---".format(repr_saml(request.session['SAMLRequest'], b64=True)))
+    # Use defensive access in case session save failed (values still in session object)
+    binding = request.session.get('Binding', BINDING_HTTP_POST)
+    saml_request = request.session.get('SAMLRequest')
+    
+    logger.debug(f"SSO requested to IDP with binding {binding}")
+    if saml_request:
+        logger.debug(f"--- SAML request [\n{repr_saml(saml_request, b64=True)}] ---")
+    else:
+        logger.warning("SAML2 SSO Entry: SAMLRequest missing from session after storage attempt")
 
-    return HttpResponseRedirect(reverse('djangosaml2idp:saml_login_process'))
+    # Create redirect response
+    response = HttpResponseRedirect(reverse('djangosaml2idp:saml_login_process'))
+    
+    # Set state UUID cookie for hybrid storage approach (survives cross-site redirects)
+    # Cookie attributes: SameSite=None (required for cross-site), Secure=True (required for SameSite=None),
+    # HttpOnly=True (security), max_age=600 (10 minutes, matches cache timeout)
+    response.set_cookie(
+        'saml2_auth_state',
+        state_uuid,
+        max_age=600,  # 10 minutes
+        path='/',
+        domain=None,  # Use default domain
+        secure=True,  # Required for SameSite=None
+        httponly=True,  # Security: prevent JavaScript access
+        samesite='None'  # Required for cross-site redirects
+    )
+    
+    logger.debug(
+        f"SAML2 SSO Entry: Set state cookie. State UUID: {state_uuid}, "
+        f"Cookie: saml2_auth_state"
+    )
+    
+    return response
 
 
 def check_access(processor: BaseProcessor, request: HttpRequest) -> None:
@@ -225,7 +318,180 @@ class LoginProcessView(LoginRequiredMixin, IdPHandlerViewMixin, View):
     """
 
     def get(self, request, *args, **kwargs):
-        binding = request.session.get('Binding', BINDING_HTTP_POST)
+        # Log request details for debugging
+        logger.debug(
+            f"SAML2 Login Process: Request received. "
+            f"Path: {request.path}, "
+            f"Method: {request.method}, "
+            f"Session key: {request.session.session_key if hasattr(request.session, 'session_key') else 'None'}, "
+            f"User: {request.user.username if request.user.is_authenticated else 'Anonymous'}, "
+            f"User-Agent: {request.META.get('HTTP_USER_AGENT', 'Unknown')[:100]}"
+        )
+        
+        # Try to get SAMLRequest from session (primary source)
+        saml_request = None
+        binding = BINDING_HTTP_POST
+        relay_state = ''
+        
+        try:
+            saml_request = request.session['SAMLRequest']
+            binding = request.session.get('Binding', BINDING_HTTP_POST)
+            relay_state = request.session.get('RelayState', '')
+            logger.debug(
+                f"SAML2 Login Process: Retrieved from session. "
+                f"Binding: {binding}, "
+                f"RelayState present: {bool(relay_state)}"
+            )
+        except KeyError as session_error:
+            # Session data missing - try hybrid cache fallback (UUID-based)
+            logger.warning(
+                f"SAML2 Login Process: SAMLRequest missing from session (KeyError: {session_error}). "
+                f"Session key: {request.session.session_key if hasattr(request.session, 'session_key') else 'None'}, "
+                f"Session keys available: {list(request.session.keys())}, "
+                f"Attempting hybrid cache fallback (UUID-based)..."
+            )
+            
+            # Hybrid approach: Try UUID-based cache lookup
+            state_uuid_from_session = request.session.get('saml2_auth_state_uuid')
+            state_uuid_from_cookie = request.COOKIES.get('saml2_auth_state')
+            
+            # Security validation: Prefer session UUID, validate if both exist
+            state_uuid = None
+            if state_uuid_from_session:
+                state_uuid = state_uuid_from_session
+                if state_uuid_from_cookie and state_uuid_from_cookie != state_uuid_from_session:
+                    logger.warning(
+                        f"SAML2 Login Process: UUID mismatch detected. "
+                        f"Session UUID: {state_uuid_from_session[:8]}..., "
+                        f"Cookie UUID: {state_uuid_from_cookie[:8]}... "
+                        f"Using session UUID (more secure). Possible stale cookie or session hijacking attempt."
+                    )
+            elif state_uuid_from_cookie:
+                # Validate UUID format
+                try:
+                    uuid.UUID(state_uuid_from_cookie)  # Validate format
+                    state_uuid = state_uuid_from_cookie
+                    logger.debug(
+                        f"SAML2 Login Process: Using cookie UUID (session UUID missing). "
+                        f"Cookie UUID: {state_uuid[:8]}..."
+                    )
+                except (ValueError, TypeError) as uuid_error:
+                    logger.error(
+                        f"SAML2 Login Process: Invalid UUID format in cookie: {uuid_error}. "
+                        f"Cookie value: {state_uuid_from_cookie[:20]}..."
+                    )
+                    state_uuid = None
+            
+            # Try UUID-based cache lookup
+            if state_uuid:
+                try:
+                    cache_key = f'saml2_request_{state_uuid}'
+                    cache_data = cache.get(cache_key)
+                    if cache_data:
+                        # Validate cache data structure before using
+                        cached_saml_request = cache_data.get('SAMLRequest')
+                        cached_binding = cache_data.get('Binding')
+                        cached_relay_state = cache_data.get('RelayState', '')
+                        
+                        if cached_saml_request and cached_binding:
+                            saml_request = cached_saml_request
+                            binding = cached_binding
+                            relay_state = cached_relay_state
+                            logger.info(
+                                f"SAML2 Login Process: Retrieved from UUID-based cache. "
+                                f"Cache key: {cache_key}, "
+                                f"Binding: {binding}, "
+                                f"UUID source: {'session' if state_uuid_from_session else 'cookie'}"
+                            )
+                            # Restore to session for future use
+                            try:
+                                request.session['SAMLRequest'] = saml_request
+                                request.session['Binding'] = binding
+                                request.session['RelayState'] = relay_state
+                                request.session['saml2_auth_state_uuid'] = state_uuid  # Restore UUID too
+                                request.session.save()
+                                logger.debug("SAML2 Login Process: Restored cache data to session")
+                            except Exception as restore_error:
+                                logger.warning(f"SAML2 Login Process: Failed to restore cache data to session: {restore_error}")
+                        else:
+                            logger.error(
+                                f"SAML2 Login Process: UUID-based cache data incomplete. "
+                                f"Cache key: {cache_key}, "
+                                f"Has SAMLRequest: {bool(cached_saml_request)}, "
+                                f"Has Binding: {bool(cached_binding)}"
+                            )
+                    else:
+                        logger.warning(
+                            f"SAML2 Login Process: UUID-based cache lookup failed. "
+                            f"Cache key: {cache_key} not found. "
+                            f"Attempting session-key-based fallback..."
+                        )
+                except Exception as cache_error:
+                    logger.error(f"SAML2 Login Process: UUID-based cache lookup error: {cache_error}")
+            
+            # Final fallback: Try old session-key-based cache lookup (backward compatibility)
+            if not saml_request:
+                session_key = request.session.session_key
+                if session_key:
+                    try:
+                        cache_key = f'saml2_request_{session_key}'
+                        cache_data = cache.get(cache_key)
+                        if cache_data:
+                            cached_saml_request = cache_data.get('SAMLRequest')
+                            cached_binding = cache_data.get('Binding')
+                            cached_relay_state = cache_data.get('RelayState', '')
+                            
+                            if cached_saml_request and cached_binding:
+                                saml_request = cached_saml_request
+                                binding = cached_binding
+                                relay_state = cached_relay_state
+                                logger.info(
+                                    f"SAML2 Login Process: Retrieved from session-key-based cache fallback (backward compatibility). "
+                                    f"Cache key: {cache_key}, "
+                                    f"Binding: {binding}"
+                                )
+                                # Restore to session
+                                try:
+                                    request.session['SAMLRequest'] = saml_request
+                                    request.session['Binding'] = binding
+                                    request.session['RelayState'] = relay_state
+                                    request.session.save()
+                                    logger.debug("SAML2 Login Process: Restored session-key-based cache data to session")
+                                except Exception as restore_error:
+                                    logger.warning(f"SAML2 Login Process: Failed to restore cache data to session: {restore_error}")
+                            else:
+                                logger.error(
+                                    f"SAML2 Login Process: Session-key-based cache data incomplete. "
+                                    f"Cache key: {cache_key}"
+                                )
+                        else:
+                            logger.error(
+                                f"SAML2 Login Process: All cache fallbacks failed. "
+                                f"Session-key cache key: {cache_key} not found. "
+                                f"This indicates session was lost between SSO entry and login process."
+                            )
+                    except Exception as cache_error:
+                        logger.error(f"SAML2 Login Process: Session-key-based cache fallback error: {cache_error}")
+            
+            # If still no SAMLRequest, raise user-friendly error
+            if not saml_request:
+                error_msg = (
+                    "SAML2 authentication request data was lost. This can happen if:\n"
+                    "- Your browser blocks third-party cookies\n"
+                    "- Session cookies expired between redirects\n"
+                    "- Browser security settings are too strict\n\n"
+                    "Please try again. If the problem persists, check your browser's cookie settings."
+                )
+                logger.error(
+                    f"SAML2 Login Process: Cannot proceed - no SAMLRequest found. "
+                    f"Session: {request.session.session_key}, "
+                    f"Session keys: {list(request.session.keys())}"
+                )
+                return error_cbv.handle_error(
+                    request, 
+                    exception=ValidationError(error_msg), 
+                    status_code=400
+                )
 
         # TODO: would it be better to store SAML info in request objects?
         # AuthBackend takes request obj as argument...
@@ -233,7 +499,7 @@ class LoginProcessView(LoginRequiredMixin, IdPHandlerViewMixin, View):
             idp_server = IDP.load()
 
             # Parse incoming request
-            req_info = idp_server.parse_authn_request(request.session['SAMLRequest'], binding)
+            req_info = idp_server.parse_authn_request(saml_request, binding)
 
             # check SAML request signature
             try:
@@ -257,12 +523,27 @@ class LoginProcessView(LoginRequiredMixin, IdPHandlerViewMixin, View):
         except Exception as e:
             return error_cbv.handle_error(request, exception=e, status_code=500)
 
+        # Validate binding consistency: cached binding (used for parsing) vs response binding (authoritative)
+        # The response binding comes from SAML response and is authoritative, but we log for debugging
+        response_binding = resp_args['binding']
+        if binding != response_binding:
+            logger.debug(
+                f"SAML2 Login Process: Binding mismatch detected. "
+                f"Cached/parsed binding: {binding}, Response binding: {response_binding}. "
+                f"Using response binding (authoritative)."
+            )
+        else:
+            logger.debug(
+                f"SAML2 Login Process: Binding consistency verified. "
+                f"Both cached and response binding: {response_binding}"
+            )
+
         html_response = self.create_html_response(
             request,
-            binding=resp_args['binding'],
+            binding=response_binding,  # Use response binding (authoritative from SAML response)
             authn_resp=authn_resp,
             destination=resp_args['destination'],
-            relay_state=request.session['RelayState'])
+            relay_state=relay_state)
 
         logger.debug("--- SAML Authn Response [\n{}] ---".format(repr_saml(str(authn_resp))))
         return self.render_response(request, html_response, service_provider.processor)
