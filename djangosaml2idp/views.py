@@ -1,4 +1,5 @@
 import base64
+import binascii
 import logging
 from typing import Dict, List, Optional, Union
 
@@ -52,6 +53,11 @@ def store_params_in_session(request: HttpRequest) -> None:
         saml_request = passed_data['SAMLRequest']
     except (KeyError, MultiValueDictKeyError) as e:
         raise ValidationError(_('not a valid SAMLRequest: {}').format(repr(e)))
+
+    try:
+        base64.b64decode(saml_request, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValidationError(_('not a valid base64 SAMLRequest: {}').format(repr(e)))
 
     request.session['Binding'] = binding
     request.session['SAMLRequest'] = saml_request
@@ -226,6 +232,14 @@ class LoginProcessView(LoginRequiredMixin, IdPHandlerViewMixin, View):
 
     def get(self, request, *args, **kwargs):
         binding = request.session.get('Binding', BINDING_HTTP_POST)
+        saml_request = request.session.get('SAMLRequest')
+
+        if not saml_request:
+            return error_cbv.handle_error(
+                request,
+                exception=ValueError("Missing SAMLRequest in session for login processing."),
+                status_code=400,
+            )
 
         # TODO: would it be better to store SAML info in request objects?
         # AuthBackend takes request obj as argument...
@@ -233,7 +247,7 @@ class LoginProcessView(LoginRequiredMixin, IdPHandlerViewMixin, View):
             idp_server = IDP.load()
 
             # Parse incoming request
-            req_info = idp_server.parse_authn_request(request.session['SAMLRequest'], binding)
+            req_info = idp_server.parse_authn_request(saml_request, binding)
 
             # check SAML request signature
             try:
@@ -262,7 +276,7 @@ class LoginProcessView(LoginRequiredMixin, IdPHandlerViewMixin, View):
             binding=resp_args['binding'],
             authn_resp=authn_resp,
             destination=resp_args['destination'],
-            relay_state=request.session['RelayState'])
+            relay_state=request.session.get('RelayState', ""))
 
         logger.debug("--- SAML Authn Response [\n{}] ---".format(repr_saml(str(authn_resp))))
         return self.render_response(request, html_response, service_provider.processor)

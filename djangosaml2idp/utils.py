@@ -1,4 +1,5 @@
 import base64
+import binascii
 import datetime
 import xml.dom.minidom
 from saml2.response import StatusResponse
@@ -21,9 +22,14 @@ def repr_saml(saml: str, b64: bool = False):
         dom = xml.dom.minidom.parseString(msg)
     except (UnicodeDecodeError, ExpatError):
         # in HTTP-REDIRECT the base64 must be inflated
-        compressed = base64.b64decode(saml)
-        inflated = zlib.decompress(compressed, -15)
-        dom = xml.dom.minidom.parseString(inflated.decode())
+        try:
+            compressed = base64.b64decode(saml)
+            inflated = zlib.decompress(compressed, -15)
+            dom = xml.dom.minidom.parseString(inflated.decode())
+        except (binascii.Error, ValueError, UnicodeDecodeError, ExpatError, zlib.error):
+            return "<invalid-saml-payload/>"
+    except (binascii.Error, ValueError, zlib.error):
+        return "<invalid-saml-payload/>"
     return dom.toprettyxml()
 
 
